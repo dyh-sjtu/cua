@@ -131,14 +131,27 @@ impl WorkerProcess {
     }
 }
 
-// The private worker communicates over pipes and is not an interactive CLI.
-// Suppress console allocation when its host is a Windows GUI application.
-#[cfg(windows)]
-fn configure_private_worker_console(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
+// Keep the private worker's process policy and pipe setup in one constructor.
+fn private_worker_command(binary_path: &std::ffi::OsStr, inherit_stderr: bool) -> Command {
+    let mut command = Command::new(binary_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
 
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    command.creation_flags(CREATE_NO_WINDOW);
+        // Private workers are pipe-based, not interactive CLI processes. Prevent
+        // console allocation even when the host is a Windows GUI application.
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(if inherit_stderr {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
+    command
 }
 
 pub(crate) struct PrivateWorkerClient {
@@ -150,20 +163,14 @@ pub(crate) struct PrivateWorkerClient {
 impl PrivateWorkerClient {
     pub(crate) fn spawn(options: ValidatedWorkerOptions) -> Result<Arc<Self>, DriverError> {
         let generation = Uuid::new_v4().to_string();
-        let mut command = Command::new(&options.binary_path);
-        #[cfg(windows)]
-        configure_private_worker_console(&mut command);
+        let mut command = private_worker_command(
+            std::ffi::OsStr::new(&options.binary_path),
+            options.inherit_stderr,
+        );
         command
             .arg("__private-worker")
             .arg("--generation")
             .arg(&generation)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(if options.inherit_stderr {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
             .env_clear();
         for variable in safe_environment(&options.environment) {
             command.env(variable.name, variable.value);
@@ -592,36 +599,54 @@ mod tests {
     #[test]
     fn private_worker_suppresses_console_and_preserves_pipes() {
         use std::io::Write;
-        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
 
+        let executable = std::env::current_exe().unwrap();
         for inherit_stderr in [false, true] {
-            let mut command = Command::new(std::env::current_exe().unwrap());
-            super::configure_private_worker_console(&mut command);
+            // Use the production command constructor, including its pipes and
+            // stderr policy; do not independently set creation flags here.
+            let mut command = super::private_worker_command(executable.as_os_str(), inherit_stderr);
             command
                 .args([
                     "--exact",
                     "worker::tests::private_worker_console_probe",
                     "--nocapture",
                 ])
-                .env("CUA_TEST_PRIVATE_WORKER_CONSOLE", "1")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(if inherit_stderr {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                });
+                .env("CUA_TEST_PRIVATE_WORKER_CONSOLE", "1");
             let mut child = command.spawn().unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(b"private-worker-ping\n")
-                .unwrap();
+            let sent = match child.stdin.take() {
+                Some(mut stdin) => stdin.write_all(b"private-worker-ping\n"),
+                None => Err(std::io::Error::other("production command must pipe stdin")),
+            };
+            if let Err(error) = sent {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("write probe input: {error}");
+            }
+
+            // The probe emits only a short reply, so its output fits in the pipe
+            // while we wait. Kill and reap on failure instead of hanging CI.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    outcome => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("console probe did not exit within 10s: {outcome:?}");
+                    }
+                }
+            }
             let output = child.wait_with_output().unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(output.status.success(), "probe failed: {stdout}");
-            assert!(stdout.contains("private-worker-pong"), "missing reply: {stdout}");
+            assert!(
+                stdout.contains("private-worker-pong"),
+                "missing reply: {stdout}"
+            );
         }
     }
 
